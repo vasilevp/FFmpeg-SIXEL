@@ -24,6 +24,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <time.h>
 #include <sixel.h>
 #include "avdevice.h"
 #include "libavutil/pixdesc.h"
@@ -200,37 +201,58 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
                                            AVPacket *const pkt)
 {
     SIXELSTATUS status = SIXEL_FALSE;
+    int pixelformat;
+    
+    /* Determine pixel format for libsixel */
+    switch (encctx->format) {
+        case AV_PIX_FMT_BGR24:
+            pixelformat = SIXEL_PIXELFORMAT_BGR888;
+            break;
+        case AV_PIX_FMT_BGR0:
+        case AV_PIX_FMT_BGRA:
+            pixelformat = SIXEL_PIXELFORMAT_BGRA8888;
+            break;
+        case AV_PIX_FMT_RGB24:
+        default:
+            pixelformat = SIXEL_PIXELFORMAT_RGB888;
+            break;
+    }
 
     /* create histgram and construct color palette
      * with median cut algorithm. */
     status = sixel_dither_initialize(c->testdither, pkt->data,
-                                     encctx->width, encctx->height, 3,
+                                     encctx->width, encctx->height, pixelformat,
                                      LARGE_NORM, REP_CENTER_BOX,
                                      QUALITY_LOW);
     if (SIXEL_FAILED(status))
         return status;
 
-    /* check whether the scence is changed. use old palette
-     * if scene is not changed. */
-    if (detect_scene_change(c)) {
-        if (c->dither)
-            sixel_dither_unref(c->dither);
-        c->dither = c->testdither;
+    /* Always create a new dither with fresh palette for each frame.
+     * 
+     * The original code had a scene change optimization that would reuse
+     * the old dither palette when the scene didn't change (using body_only mode).
+     * However, this causes color corruption when frames become stationary.
+     * 
+     * The issue appears to be that body_only mode in libsixel doesn't work
+     * correctly for streaming video, possibly due to terminal state assumptions
+     * or palette caching issues. Since correctness is more important than
+     * the bandwidth savings from palette reuse, we always generate fresh palettes.
+     */
+    if (c->dither)
+        sixel_dither_unref(c->dither);
+    c->dither = c->testdither;
 #if defined(LIBSIXEL_LEGACY_API)
-        c->testdither = sixel_dither_create(c->reqcolors);
-        if (c->testdither == NULL)
-            return SIXEL_FALSE;
+    c->testdither = sixel_dither_create(c->reqcolors);
+    if (c->testdither == NULL)
+        return SIXEL_FALSE;
 #else
-        status = sixel_dither_new(&c->testdither, c->reqcolors, NULL);
-        if (SIXEL_FAILED(status))
-            return status;
+    status = sixel_dither_new(&c->testdither, c->reqcolors, NULL);
+    if (SIXEL_FAILED(status))
+        return status;
 #endif
-        sixel_dither_set_diffusion_type(c->dither, c->diffuse);
-    } else {
-        sixel_dither_set_body_only(c->dither, 1);
-    }
+    sixel_dither_set_diffusion_type(c->dither, c->diffuse);
 
-    return status;
+    return SIXEL_OK;
 }
 
 static int sixel_write(char *data, int size, void *priv)
@@ -251,9 +273,12 @@ static int sixel_write_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    if (encctx->format != AV_PIX_FMT_RGB24) {
+    if (encctx->format != AV_PIX_FMT_RGB24 && 
+        encctx->format != AV_PIX_FMT_BGR24 &&
+        encctx->format != AV_PIX_FMT_BGR0 &&
+        encctx->format != AV_PIX_FMT_BGRA) {
         av_log(s, AV_LOG_ERROR,
-               "Unsupported pixel format '%s', choose rgb24\n",
+               "Unsupported pixel format '%s', choose rgb24, bgr24, bgr0, or bgra\n",
                av_get_pix_fmt_name(encctx->format));
         return AVERROR(EINVAL);
     }
@@ -359,8 +384,25 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
 #endif
         return AVERROR_EXTERNAL;
     }
+    
+    /* Determine the correct pixel format for libsixel based on input format */
+    int sixel_format;
+    switch (encctx->format) {
+        case AV_PIX_FMT_BGR24:
+            sixel_format = SIXEL_PIXELFORMAT_BGR888;
+            break;
+        case AV_PIX_FMT_BGR0:
+        case AV_PIX_FMT_BGRA:
+            sixel_format = SIXEL_PIXELFORMAT_BGRA8888;
+            break;
+        case AV_PIX_FMT_RGB24:
+        default:
+            sixel_format = SIXEL_PIXELFORMAT_RGB888;
+            break;
+    }
+    
     status = sixel_encode(pkt->data, encctx->width, encctx->height,
-                          PIXELFORMAT_RGB888,
+                          sixel_format,
                           c->dither, c->output);
     if (SIXEL_FAILED(status)) {
 #if !defined(LIBSIXEL_LEGACY_API)
