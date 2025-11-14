@@ -30,6 +30,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavformat/mux.h"
 #include "libavutil/time.h"
+#include "libavutil/mem.h"
 
 #if !defined(SIXELAPI)
 #  define LIBSIXEL_LEGACY_API
@@ -56,6 +57,17 @@ typedef struct SIXELContext {
     int threshold;
     int dropframe;
     int ignoredelay;
+    int encode_policy;
+    int use_8bit_mode;
+    int complexion_score;
+    int method_for_rep;
+    int64_t dropped_frames;
+    int64_t rendered_frames;
+    int64_t last_render_time;  /* Time when last frame was rendered */
+    int64_t avg_render_time;   /* Moving average of render time */
+    uint8_t *prev_frame;       /* Previous frame data for duplicate detection */
+    int prev_frame_size;       /* Size of previous frame buffer */
+    int64_t skipped_dup_frames; /* Count of skipped duplicate frames */
 } SIXELContext;
 
 static FILE *sixel_output_file = NULL;
@@ -125,6 +137,8 @@ static SIXELSTATUS prepare_static_palette(SIXELContext *const c,
         if (c->dither == NULL)
             return SIXEL_FALSE;
         sixel_dither_set_diffusion_type(c->dither, c->diffuse);
+        /* Enable palette optimization */
+        sixel_dither_set_optimize_palette(c->dither, 1);
     }
     return SIXEL_OK;
 }
@@ -219,11 +233,14 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
     }
 
     /* create histgram and construct color palette
-     * with median cut algorithm. */
+     * with median cut algorithm.
+     * Using LARGE_LUM for perceptually better color quantization
+     * and REP_AVERAGE_PIXELS for more accurate representative colors. */
     status = sixel_dither_initialize(c->testdither, pkt->data,
                                      encctx->width, encctx->height, pixelformat,
-                                     LARGE_NORM, REP_CENTER_BOX,
-                                     QUALITY_LOW);
+                                     LARGE_LUM, 
+                                     c->method_for_rep ? c->method_for_rep : REP_AVERAGE_PIXELS,
+                                     QUALITY_FULL);
     if (SIXEL_FAILED(status))
         return status;
 
@@ -251,6 +268,14 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
         return status;
 #endif
     sixel_dither_set_diffusion_type(c->dither, c->diffuse);
+    
+    /* Set complexion score for better skin tone preservation */
+    if (c->complexion_score > 0) {
+        sixel_dither_set_complexion_score(c->dither, c->complexion_score);
+    }
+    
+    /* Enable palette optimization to reduce palette to only used colors */
+    sixel_dither_set_optimize_palette(c->dither, 1);
 
     return SIXEL_OK;
 }
@@ -308,6 +333,20 @@ static int sixel_write_header(AVFormatContext *s)
         return AVERROR_EXTERNAL;
     }
 
+    /* Set encoding policy for compression */
+    sixel_output_set_encode_policy(c->output, c->encode_policy);
+    
+    /* Use HLS color space for more perceptually uniform palette */
+    sixel_output_set_palette_type(c->output, PALETTETYPE_HLS);
+    
+    /* Allow unlimited repeat counts for better RLE compression */
+    sixel_output_set_gri_arg_limit(c->output, 0);
+    
+    /* Enable 8-bit mode for smaller escape sequences */
+    if (c->use_8bit_mode) {
+        sixel_output_set_8bit_availability(c->output, 1);
+    }
+
     if (isatty(fileno(sixel_output_file))) {
         fprintf(sixel_output_file, "\033[?25l");      /* hide cursor */
     } else {
@@ -343,8 +382,8 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
     SIXELContext * const c = s->priv_data;
     AVCodecParameters * const encctx = s->streams[0]->codecpar;
     int64_t curtime, delay;
+    int64_t render_start, render_end, render_time;
     struct timespec ts;
-    int late_threshold;
     static int dirty = 0;
     SIXELSTATUS status = SIXEL_FALSE;
 
@@ -353,17 +392,58 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
         c->time_frame += INT64_C(1000000);
         curtime = av_gettime();
         delay = c->time_frame * av_q2d(c->time_base) - curtime;
-        if (delay <= 0) {
-            if (c->dropframe) {
-                /* late threshold of dropping this frame */
-                late_threshold = INT64_C(-1000000) * av_q2d(c->time_base);
-                if (delay < late_threshold)
-                    return 0;
+        
+        if (c->dropframe) {
+            /* Aggressive frame dropping: drop if we're behind at all */
+            if (delay <= 0) {
+                c->dropped_frames++;
+                return 0;
             }
+            
+            /* Also predict if we'll be late based on average render time */
+            if (c->avg_render_time > 0) {
+                int64_t predicted_finish = curtime + c->avg_render_time;
+                int64_t frame_deadline = c->time_frame * av_q2d(c->time_base);
+                
+                if (predicted_finish > frame_deadline) {
+                    /* We predict we'll be late - drop this frame preemptively */
+                    c->dropped_frames++;
+                    return 0;
+                }
+            }
+            
+            /* Don't sleep at all - render as fast as possible and let dropping keep us in sync */
         } else {
-            ts.tv_sec = delay / 1000000;
-            ts.tv_nsec = (delay % 1000000) * 1000;
-            nanosleep(&ts, NULL);
+            /* Not in dropframe mode - use normal sleep logic */
+            if (delay > 0) {
+                ts.tv_sec = delay / 1000000;
+                ts.tv_nsec = (delay % 1000000) * 1000;
+                nanosleep(&ts, NULL);
+            }
+        }
+    }
+
+    /* Start measuring render time */
+    render_start = av_gettime();
+    
+    /* Check for duplicate frame */
+    if (c->prev_frame && pkt->size == c->prev_frame_size) {
+        if (memcmp(pkt->data, c->prev_frame, pkt->size) == 0) {
+            /* Frame is identical to previous - skip rendering */
+            c->skipped_dup_frames++;
+            return 0;
+        }
+    }
+    
+    /* Allocate or reallocate prev_frame buffer if needed */
+    if (!c->prev_frame || pkt->size != c->prev_frame_size) {
+        c->prev_frame = av_realloc(c->prev_frame, pkt->size);
+        if (!c->prev_frame) {
+            av_log(s, AV_LOG_ERROR, "Failed to allocate duplicate detection buffer\n");
+            c->prev_frame_size = 0;
+            /* Continue without dup detection */
+        } else {
+            c->prev_frame_size = pkt->size;
         }
     }
 
@@ -411,6 +491,25 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EXTERNAL;
     }
     fflush(sixel_output_file);
+    
+    /* Save current frame for duplicate detection */
+    if (c->prev_frame && c->prev_frame_size == pkt->size) {
+        memcpy(c->prev_frame, pkt->data, pkt->size);
+    }
+    
+    /* Measure render time and update moving average */
+    render_end = av_gettime();
+    render_time = render_end - render_start;
+    
+    /* Update moving average (exponential moving average with alpha=0.3) */
+    if (c->avg_render_time == 0) {
+        c->avg_render_time = render_time;  /* First frame */
+    } else {
+        c->avg_render_time = (c->avg_render_time * 7 + render_time * 3) / 10;
+    }
+    
+    c->rendered_frames++;
+    
     return 0;
 }
 
@@ -421,6 +520,17 @@ static int sixel_write_trailer(AVFormatContext *s)
 
 static void sixel_deinit(AVFormatContext *s) {
     SIXELContext * const c = s->priv_data;
+
+    /* Print final statistics */
+    if (c->dropframe) {
+        int64_t total = c->rendered_frames + c->dropped_frames + c->skipped_dup_frames;
+        double drop_pct = total > 0 ? (100.0 * c->dropped_frames / total) : 0.0;
+        double dup_pct = total > 0 ? (100.0 * c->skipped_dup_frames / total) : 0.0;
+        av_log(s, AV_LOG_INFO, "SIXEL final stats: rendered=%lld dropped=%lld (%.1f%%) skipped_dup=%lld (%.1f%%) total=%lld avg_render_time=%lld us\n",
+               (long long)c->rendered_frames, (long long)c->dropped_frames, drop_pct, 
+               (long long)c->skipped_dup_frames, dup_pct,
+               (long long)total, (long long)c->avg_render_time);
+    }
 
     if (isatty(fileno(sixel_output_file))) {
         fprintf(sixel_output_file,
@@ -433,6 +543,13 @@ static void sixel_deinit(AVFormatContext *s) {
         fclose(sixel_output_file);
         sixel_output_file = NULL;
     }
+    
+    /* Free duplicate detection buffer */
+    if (c->prev_frame) {
+        av_free(c->prev_frame);
+        c->prev_frame = NULL;
+    }
+    
     if (c->output) {
         sixel_output_unref(c->output);
         c->output = NULL;
@@ -451,25 +568,39 @@ static void sixel_deinit(AVFormatContext *s) {
 #define OFFSET(x) offsetof(SIXELContext, x)
 #define ENC AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "left",            "left position",          OFFSET(left),        AV_OPT_TYPE_INT,    {.i64 = 0},                0, 256,  ENC },
-    { "top",             "top position",           OFFSET(top),         AV_OPT_TYPE_INT,    {.i64 = 0},                0, 256,  ENC },
-    { "reqcolors",       "number of colors",       OFFSET(reqcolors),   AV_OPT_TYPE_INT,    {.i64 = 16},               2, 256,  ENC },
-    { "fixedpal",        "use fixed palette",      OFFSET(fixedpal),    AV_OPT_TYPE_INT,    {.i64 = 0},                0, 1,    ENC, "fixedpal" },
-    { "true",            NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 1},                0, 0,    ENC, "fixedpal" },
-    { "false",           NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 0},                0, 0,    ENC, "fixedpal" },
-    { "diffuse",         "dithering method",       OFFSET(diffuse),     AV_OPT_TYPE_INT,    {.i64 = DIFFUSE_ATKINSON}, 1, 6,    ENC, "diffuse" },
-    { "none",            NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_NONE},     0, 0,    ENC, "diffuse" },
-    { "fs",              NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_FS},       0, 0,    ENC, "diffuse" },
-    { "atkinson",        NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_ATKINSON}, 0, 0,    ENC, "diffuse" },
-    { "jajuni",          NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_JAJUNI},   0, 0,    ENC, "diffuse" },
-    { "stucki",          NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_STUCKI},   0, 0,    ENC, "diffuse" },
-    { "burkes",          NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_BURKES},   0, 0,    ENC, "diffuse" },
+    { "left",            "left position",           OFFSET(left),            AV_OPT_TYPE_INT,    {.i64 = 0},                  0, 256,  ENC },
+    { "top",             "top position",            OFFSET(top),             AV_OPT_TYPE_INT,    {.i64 = 0},                  0, 256,  ENC },
+    { "reqcolors",       "number of colors",        OFFSET(reqcolors),       AV_OPT_TYPE_INT,    {.i64 = 16},                 2, 256,  ENC },
+    { "fixedpal",        "use fixed palette",       OFFSET(fixedpal),        AV_OPT_TYPE_INT,    {.i64 = 0},                  0, 1,    ENC, "fixedpal" },
+    { "true",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = 1},                  0, 0,    ENC, "fixedpal" },
+    { "false",           NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = 0},                  0, 0,    ENC, "fixedpal" },
+    { "diffuse",         "dithering method",        OFFSET(diffuse),         AV_OPT_TYPE_INT,    {.i64 = DIFFUSE_AUTO},       0, 8,    ENC, "diffuse" },
+    { "auto",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_AUTO},       0, 0,    ENC, "diffuse" },
+    { "none",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_NONE},       0, 0,    ENC, "diffuse" },
+    { "atkinson",        NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_ATKINSON},   0, 0,    ENC, "diffuse" },
+    { "fs",              NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_FS},         0, 0,    ENC, "diffuse" },
+    { "jajuni",          NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_JAJUNI},     0, 0,    ENC, "diffuse" },
+    { "stucki",          NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_STUCKI},     0, 0,    ENC, "diffuse" },
+    { "burkes",          NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_BURKES},     0, 0,    ENC, "diffuse" },
+    { "a_dither",        NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_A_DITHER},   0, 0,    ENC, "diffuse" },
+    { "x_dither",        NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = DIFFUSE_X_DITHER},   0, 0,    ENC, "diffuse" },
+    { "encode-policy",   "encoding policy",         OFFSET(encode_policy),   AV_OPT_TYPE_INT,    {.i64 = 2},                  0, 2,    ENC, "encode_policy" },
+    { "auto",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = 0},                  0, 0,    ENC, "encode_policy" },
+    { "fast",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = 1},                  0, 0,    ENC, "encode_policy" },
+    { "size",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = 2},                  0, 0,    ENC, "encode_policy" },
+    { "8bit-mode",       "use 8-bit control codes", OFFSET(use_8bit_mode),   AV_OPT_TYPE_BOOL,   {.i64 = 0},                  0, 1,    ENC },
+    { "complexion-score", "skin tone improvement", OFFSET(complexion_score), AV_OPT_TYPE_INT,    {.i64 = 0},                  0, 100,  ENC },
+    { "method-for-rep",  "color selection method",  OFFSET(method_for_rep),  AV_OPT_TYPE_INT,    {.i64 = REP_AVERAGE_PIXELS}, 0, 3,    ENC, "method_for_rep" },
+    { "auto",            NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = REP_AUTO},           0, 0,    ENC, "method_for_rep" },
+    { "center-box",      NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = REP_CENTER_BOX},     0, 0,    ENC, "method_for_rep" },
+    { "average-colors",  NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = REP_AVERAGE_COLORS}, 0, 0,    ENC, "method_for_rep" },
+    { "average-pixels",  NULL,                      0,                       AV_OPT_TYPE_CONST,  {.i64 = REP_AVERAGE_PIXELS}, 0, 0,    ENC, "method_for_rep" },
+    { "dropframe",       "drop late frames",       OFFSET(dropframe),        AV_OPT_TYPE_BOOL,   {.i64 = 0},                  0, 1,    ENC, "dropframe" },
+    { "ignoredelay",     "ignore frame timestamp", OFFSET(ignoredelay),      AV_OPT_TYPE_BOOL,   {.i64 = 0},                  0, 1,    ENC, "ignoredelay" },
 #if 0  /* for debugging */
     { "scene-threshold", "scene change threshold", OFFSET(threshold),   AV_OPT_TYPE_INT,    {.i64 = 500},              0, 10000,ENC },
-    { "dropframe",       "drop late frames",       OFFSET(dropframe),   AV_OPT_TYPE_INT,    {.i64 = 1},                0, 1,    ENC, "dropframe" },
     { "true",            NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 1},                0, 0,    ENC, "dropframe" },
     { "false",           NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 0},                0, 0,    ENC, "dropframe" },
-    { "ignoredelay",     "ignore frame timestamp", OFFSET(ignoredelay), AV_OPT_TYPE_INT,    {.i64 = 0},                0, 1,    ENC, "ignoredelay" },
     { "true",            NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 1},                0, 0,    ENC, "ignoredelay" },
     { "false",           NULL,                     0,                   AV_OPT_TYPE_CONST,  {.i64 = 0},                0, 0,    ENC, "ignoredelay" },
 #endif
@@ -494,6 +625,6 @@ const FFOutputFormat ff_sixel_muxer = {
     .write_packet   = sixel_write_packet,
     .write_trailer  = sixel_write_trailer,
     .deinit         = sixel_deinit,
-    .p.flags        = AVFMT_NOFILE, /* | AVFMT_VARIABLE_FPS, */
+    .p.flags        = AVFMT_NOFILE,
     .p.priv_class     = &sixel_class,
 };
