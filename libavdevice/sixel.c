@@ -22,9 +22,9 @@
 #include <unistd.h>
 #include <sys/signal.h>
 #include <termios.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
-#include <time.h>
 #include <sixel.h>
 #include "avdevice.h"
 #include "libavutil/pixdesc.h"
