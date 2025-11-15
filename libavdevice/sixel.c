@@ -426,15 +426,6 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
     /* Start measuring render time */
     render_start = av_gettime();
     
-    /* Check for duplicate frame */
-    if (c->prev_frame && pkt->size == c->prev_frame_size) {
-        if (memcmp(pkt->data, c->prev_frame, pkt->size) == 0) {
-            /* Frame is identical to previous - skip rendering */
-            c->skipped_dup_frames++;
-            return 0;
-        }
-    }
-    
     /* Allocate or reallocate prev_frame buffer if needed */
     if (!c->prev_frame || pkt->size != c->prev_frame_size) {
         c->prev_frame = av_realloc(c->prev_frame, pkt->size);
@@ -444,6 +435,15 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
             /* Continue without dup detection */
         } else {
             c->prev_frame_size = pkt->size;
+        }
+    }
+    
+    /* Check for duplicate frame using memcmp */
+    if (c->prev_frame && pkt->size == c->prev_frame_size) {
+        if (memcmp(pkt->data, c->prev_frame, pkt->size) == 0) {
+            /* Frame is identical to previous - skip rendering */
+            c->skipped_dup_frames++;
+            return 0;
         }
     }
 
@@ -463,6 +463,14 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
         av_log(s, AV_LOG_ERROR, "%s\n", sixel_helper_format_error(status));
 #endif
         return AVERROR_EXTERNAL;
+    }
+    
+    /* When dropframe is enabled, use scene detection to skip frames
+     * that didn't meaningfully change */
+    if (c->dropframe && !c->fixedpal && !detect_scene_change(c)) {
+        /* No significant scene change detected - drop this frame */
+        c->dropped_frames++;
+        return 0;
     }
     
     /* Determine the correct pixel format for libsixel based on input format */
@@ -615,6 +623,14 @@ static const AVClass sixel_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT,
 };
 
+static const AVClass sixel_vfr_class = {
+    .class_name = "sixel_vfr_outdev",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT,
+};
+
 const FFOutputFormat ff_sixel_muxer = {
     .p.name         = "sixel",
     .p.long_name    = NULL_IF_CONFIG_SMALL("SIXEL terminal device"),
@@ -627,4 +643,18 @@ const FFOutputFormat ff_sixel_muxer = {
     .deinit         = sixel_deinit,
     .p.flags        = AVFMT_NOFILE,
     .p.priv_class     = &sixel_class,
+};
+
+const FFOutputFormat ff_sixel_vfr_muxer = {
+    .p.name         = "sixel_vfr",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("SIXEL terminal device (variable framerate)"),
+    .priv_data_size = sizeof(SIXELContext),
+    .p.audio_codec  = AV_CODEC_ID_NONE,
+    .p.video_codec  = AV_CODEC_ID_RAWVIDEO,
+    .write_header   = sixel_write_header,
+    .write_packet   = sixel_write_packet,
+    .write_trailer  = sixel_write_trailer,
+    .deinit         = sixel_deinit,
+    .p.flags        = AVFMT_NOFILE | AVFMT_VARIABLE_FPS | AVFMT_NOTIMESTAMPS,
+    .p.priv_class     = &sixel_vfr_class,
 };

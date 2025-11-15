@@ -49,6 +49,7 @@ extern const FFOutputFormat ff_oss_muxer;
 extern const FFInputFormat  ff_pulse_demuxer;
 extern const FFOutputFormat ff_pulse_muxer;
 extern const FFOutputFormat ff_sixel_muxer;
+extern const FFOutputFormat ff_sixel_vfr_muxer;
 extern const FFInputFormat  ff_sndio_demuxer;
 extern const FFOutputFormat ff_sndio_muxer;
 extern const FFInputFormat  ff_v4l2_demuxer;
