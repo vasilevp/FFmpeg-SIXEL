@@ -132,19 +132,79 @@ static int get_sixel_format(int pix_fmt)
 {
     switch (pix_fmt)
     {
-    case AV_PIX_FMT_BGR24:
-        return SIXEL_PIXELFORMAT_BGR888;
-    case AV_PIX_FMT_BGR0:
-    case AV_PIX_FMT_BGRA:
-        return SIXEL_PIXELFORMAT_BGRA8888;
-    case AV_PIX_FMT_RGB565LE:
-        return SIXEL_PIXELFORMAT_RGB565;
-    case AV_PIX_FMT_BGR565LE:
-        return SIXEL_PIXELFORMAT_BGR565;
     case AV_PIX_FMT_RGB24:
         return SIXEL_PIXELFORMAT_RGB888;
+    case AV_PIX_FMT_BGR24:
+        return SIXEL_PIXELFORMAT_BGR888;
+    case AV_PIX_FMT_RGBA:
+    case AV_PIX_FMT_RGB0:
+        return SIXEL_PIXELFORMAT_RGBA8888;
+    case AV_PIX_FMT_BGRA:
+    case AV_PIX_FMT_BGR0:
+        return SIXEL_PIXELFORMAT_BGRA8888;
+    case AV_PIX_FMT_ARGB:
+        return SIXEL_PIXELFORMAT_ARGB8888;
+    case AV_PIX_FMT_ABGR:
+        return SIXEL_PIXELFORMAT_ABGR8888;
+    case AV_PIX_FMT_RGB565BE:
+    case AV_PIX_FMT_RGB565LE:
+        return SIXEL_PIXELFORMAT_RGB565;
+    case AV_PIX_FMT_BGR565BE:
+    case AV_PIX_FMT_BGR565LE:
+        return SIXEL_PIXELFORMAT_BGR565;
+    case AV_PIX_FMT_RGB555BE:
+    case AV_PIX_FMT_RGB555LE:
+        return SIXEL_PIXELFORMAT_RGB555;
+    case AV_PIX_FMT_BGR555BE:
+    case AV_PIX_FMT_BGR555LE:
+        return SIXEL_PIXELFORMAT_BGR555;
+    case AV_PIX_FMT_PAL8:
+        return SIXEL_PIXELFORMAT_PAL8;
+    case AV_PIX_FMT_GRAY8:
+        return SIXEL_PIXELFORMAT_G8;
     default:
         return -1;
+    }
+}
+
+/* Check if format needs endianness swap (LE formats need swap to BE for libsixel) */
+static int needs_endian_swap(int pix_fmt)
+{
+    switch (pix_fmt)
+    {
+    case AV_PIX_FMT_RGB565LE:
+    case AV_PIX_FMT_BGR565LE:
+    case AV_PIX_FMT_RGB555LE:
+    case AV_PIX_FMT_BGR555LE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void log_supported_formats(AVFormatContext *s)
+{
+    av_log(s, AV_LOG_ERROR, "Supported formats:");
+    
+    /* Iterate through all pixel formats and check which are supported */
+    for (enum AVPixelFormat fmt = 0; fmt < AV_PIX_FMT_NB; fmt++)
+    {
+        if (get_sixel_format(fmt) != -1)
+        {
+            av_log(s, AV_LOG_ERROR, " %s", av_get_pix_fmt_name(fmt));
+        }
+    }
+    av_log(s, AV_LOG_ERROR, "\n");
+}
+
+/* Swap endianness for 16-bit buffer (converts LE to BE for libsixel) */
+static void swap_endianness_16(uint8_t *data, int size)
+{
+    for (int i = 0; i < size; i += 2)
+    {
+        uint8_t tmp = data[i];
+        data[i] = data[i + 1];
+        data[i + 1] = tmp;
     }
 }
 
@@ -240,6 +300,12 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
     /* Determine pixel format for libsixel */
     int pixelformat = get_sixel_format(encctx->format);
 
+    /* If format needs endianness swap, do it before palette generation */
+    if (needs_endian_swap(encctx->format))
+    {
+        swap_endianness_16(pkt->data, pkt->size);
+    }
+
     /* create histgram and construct color palette
      * with median cut algorithm.
      * Using LARGE_LUM for perceptually better color quantization
@@ -249,6 +315,12 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
                                      LARGE_LUM, 
                                      c->method_for_rep ? c->method_for_rep : REP_AVERAGE_PIXELS,
                                      QUALITY_FULL);
+
+    /* Swap back if we swapped before palette generation */
+    // if (needs_endian_swap(encctx->format)) {
+    //     swap_endianness_16(pkt->data, pkt->size);
+    // }
+
     if (SIXEL_FAILED(status))
         return status;
 
@@ -306,19 +378,12 @@ static int sixel_write_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    switch (encctx->format)
+    if (get_sixel_format(encctx->format) == -1)
     {
-    case AV_PIX_FMT_BGR24:
-    case AV_PIX_FMT_BGR0:
-    case AV_PIX_FMT_BGRA:
-    case AV_PIX_FMT_RGB565LE:
-    case AV_PIX_FMT_BGR565LE:
-    case AV_PIX_FMT_RGB24:
-        break;
-    default:
         av_log(s, AV_LOG_ERROR,
-               "Unsupported pixel format '%s', choose rgb24, bgr24, rgb565, bgr565, bgr0, or bgra\n",
+               "Unsupported pixel format '%s'. ",
                av_get_pix_fmt_name(encctx->format));
+        log_supported_formats(s);
         return AVERROR(EINVAL);
     }
 
@@ -489,9 +554,20 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
     
     /* Determine the correct pixel format for libsixel based on input format */
     int sixel_format = get_sixel_format(encctx->format);
+
+    /* Swap endianness for LE formats (libsixel expects BE for 16-bit formats) */
+    // if (needs_endian_swap(encctx->format)) {
+    //     swap_endianness_16(pkt->data, pkt->size);
+    //     status = sixel_encode(pkt->data, encctx->width, encctx->height,
+    //                          sixel_format,
+    //                          c->dither, c->output);
+    /* Swap back to restore original data */
+    // swap_endianness_16(pkt->data, pkt->size);
+    // } else {
     status = sixel_encode(pkt->data, encctx->width, encctx->height,
                             sixel_format,
                             c->dither, c->output);
+    // }
 
     if (SIXEL_FAILED(status)) {
 #if !defined(LIBSIXEL_LEGACY_API)
