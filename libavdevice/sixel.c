@@ -26,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sixel.h>
+
 #include "avdevice.h"
 #include "libavutil/pixdesc.h"
 #include "libavformat/mux.h"
@@ -127,6 +128,26 @@ detected:
     return 1;
 }
 
+static int get_sixel_format(int pix_fmt)
+{
+    switch (pix_fmt)
+    {
+    case AV_PIX_FMT_BGR24:
+        return SIXEL_PIXELFORMAT_BGR888;
+    case AV_PIX_FMT_BGR0:
+    case AV_PIX_FMT_BGRA:
+        return SIXEL_PIXELFORMAT_BGRA8888;
+    case AV_PIX_FMT_RGB565LE:
+        return SIXEL_PIXELFORMAT_RGB565;
+    case AV_PIX_FMT_BGR565LE:
+        return SIXEL_PIXELFORMAT_BGR565;
+    case AV_PIX_FMT_RGB24:
+        return SIXEL_PIXELFORMAT_RGB888;
+    default:
+        return -1;
+    }
+}
+
 static SIXELSTATUS prepare_static_palette(SIXELContext *const c,
                                           AVCodecParameters *const encctx)
 {
@@ -215,22 +236,9 @@ static SIXELSTATUS prepare_dynamic_palette(SIXELContext *const c,
                                            AVPacket *const pkt)
 {
     SIXELSTATUS status = SIXEL_FALSE;
-    int pixelformat;
-    
+
     /* Determine pixel format for libsixel */
-    switch (encctx->format) {
-        case AV_PIX_FMT_BGR24:
-            pixelformat = SIXEL_PIXELFORMAT_BGR888;
-            break;
-        case AV_PIX_FMT_BGR0:
-        case AV_PIX_FMT_BGRA:
-            pixelformat = SIXEL_PIXELFORMAT_BGRA8888;
-            break;
-        case AV_PIX_FMT_RGB24:
-        default:
-            pixelformat = SIXEL_PIXELFORMAT_RGB888;
-            break;
-    }
+    int pixelformat = get_sixel_format(encctx->format);
 
     /* create histgram and construct color palette
      * with median cut algorithm.
@@ -298,12 +306,18 @@ static int sixel_write_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    if (encctx->format != AV_PIX_FMT_RGB24 && 
-        encctx->format != AV_PIX_FMT_BGR24 &&
-        encctx->format != AV_PIX_FMT_BGR0 &&
-        encctx->format != AV_PIX_FMT_BGRA) {
+    switch (encctx->format)
+    {
+    case AV_PIX_FMT_BGR24:
+    case AV_PIX_FMT_BGR0:
+    case AV_PIX_FMT_BGRA:
+    case AV_PIX_FMT_RGB565LE:
+    case AV_PIX_FMT_BGR565LE:
+    case AV_PIX_FMT_RGB24:
+        break;
+    default:
         av_log(s, AV_LOG_ERROR,
-               "Unsupported pixel format '%s', choose rgb24, bgr24, bgr0, or bgra\n",
+               "Unsupported pixel format '%s', choose rgb24, bgr24, rgb565, bgr565, bgr0, or bgra\n",
                av_get_pix_fmt_name(encctx->format));
         return AVERROR(EINVAL);
     }
@@ -474,24 +488,11 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
     
     /* Determine the correct pixel format for libsixel based on input format */
-    int sixel_format;
-    switch (encctx->format) {
-        case AV_PIX_FMT_BGR24:
-            sixel_format = SIXEL_PIXELFORMAT_BGR888;
-            break;
-        case AV_PIX_FMT_BGR0:
-        case AV_PIX_FMT_BGRA:
-            sixel_format = SIXEL_PIXELFORMAT_BGRA8888;
-            break;
-        case AV_PIX_FMT_RGB24:
-        default:
-            sixel_format = SIXEL_PIXELFORMAT_RGB888;
-            break;
-    }
-    
+    int sixel_format = get_sixel_format(encctx->format);
     status = sixel_encode(pkt->data, encctx->width, encctx->height,
-                          sixel_format,
-                          c->dither, c->output);
+                            sixel_format,
+                            c->dither, c->output);
+
     if (SIXEL_FAILED(status)) {
 #if !defined(LIBSIXEL_LEGACY_API)
         av_log(s, AV_LOG_ERROR, "%s\n", sixel_helper_format_error(status));
@@ -499,25 +500,25 @@ static int sixel_write_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EXTERNAL;
     }
     fflush(sixel_output_file);
-    
+
     /* Save current frame for duplicate detection */
     if (c->prev_frame && c->prev_frame_size == pkt->size) {
         memcpy(c->prev_frame, pkt->data, pkt->size);
     }
-    
+
     /* Measure render time and update moving average */
     render_end = av_gettime();
     render_time = render_end - render_start;
-    
+
     /* Update moving average (exponential moving average with alpha=0.3) */
     if (c->avg_render_time == 0) {
         c->avg_render_time = render_time;  /* First frame */
     } else {
         c->avg_render_time = (c->avg_render_time * 7 + render_time * 3) / 10;
     }
-    
+
     c->rendered_frames++;
-    
+
     return 0;
 }
 
