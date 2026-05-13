@@ -10,9 +10,22 @@ repos:
     - id: check-shebang-scripts-are-executable
     - id: check-yaml
     - id: end-of-file-fixer
+    - id: file-contents-sorter
+      files:
+        .forgejo/pre-commit/ignored-words.txt
+      args:
+        - --ignore-case
     - id: fix-byte-order-marker
     - id: mixed-line-ending
     - id: trailing-whitespace
+- repo: local
+  hooks:
+    - id: arm-asm-indent
+      name: fix arm/aarch64 assembly indentation
+      files: ^.*/(arm|aarch64)/.*\.S$
+      language: script
+      entry: ./tools/check_arm_indent.sh --apply
+      pass_filenames: false
 - repo: https://github.com/codespell-project/codespell
   rev: v2.4.1
   hooks:

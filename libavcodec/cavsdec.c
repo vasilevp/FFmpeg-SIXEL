@@ -25,6 +25,7 @@
  * @author Stefan Gehrer <stefan.gehrer@gmx.de>
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/emms.h"
 #include "libavutil/mem.h"
@@ -1230,7 +1231,7 @@ static int decode_seq_header(AVSContext *h)
     return 0;
 }
 
-static void cavs_flush(AVCodecContext * avctx)
+static av_cold void cavs_flush(AVCodecContext * avctx)
 {
     AVSContext *h = avctx->priv_data;
     h->got_keyframe = 0;
@@ -1279,6 +1280,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                 av_frame_unref(h->DPB[1].f);
                 h->got_keyframe = 1;
             }
+            av_fallthrough;
         case PIC_PB_START_CODE:
             if (frame_start > 1)
                 return AVERROR_INVALIDDATA;

@@ -1065,9 +1065,8 @@ typedef struct AVStreamGroupTileGrid {
  * AVStreamGroupLCEVC is meant to define the relation between video streams
  * and a data stream containing LCEVC enhancement layer NALUs.
  *
- * No more than one stream of @ref AVCodecParameters.codec_type "codec_type"
- * AVMEDIA_TYPE_DATA shall be present, and it must be of
- * @ref AVCodecParameters.codec_id "codec_id" AV_CODEC_ID_LCEVC.
+ * No more than one stream of
+ * @ref AVCodecParameters.codec_id "codec_id" AV_CODEC_ID_LCEVC shall be present.
  */
 typedef struct AVStreamGroupLCEVC {
     const AVClass *av_class;
@@ -1540,6 +1539,7 @@ typedef struct AVFormatContext {
      */
     int debug;
 #define FF_FDEBUG_TS        0x0001
+#define FF_FDEBUG_ID3V2     0x0002
 
     /**
      * The maximum number of streams.
@@ -1884,6 +1884,11 @@ typedef struct AVFormatContext {
      * @see skip_estimate_duration_from_pts
      */
     int64_t duration_probesize;
+
+    /**
+     * Name of this format context, only used for logging purposes.
+     */
+    char *name;
 } AVFormatContext;
 
 /**
@@ -2065,6 +2070,37 @@ int avformat_stream_group_add_stream(AVStreamGroup *stg, AVStream *st);
 
 AVProgram *av_new_program(AVFormatContext *s, int id);
 
+
+#define AVFMT_PROGCOPY_MATCH_BY_ID          (1 << 0) ///< match streams using stream id
+#define AVFMT_PROGCOPY_MATCH_BY_INDEX       (1 << 1) ///< match streams using stream index
+#define AVFMT_PROGCOPY_OVERWRITE            (1 << 8) ///< overwrite pre-existing program having same ID
+
+/**
+ * Copy an AVProgram from one AVFormatContext to another.
+ *
+ * Streams in the destination context whose designated attribute match the attribute of
+ * the streams in the source AVProgram index are added to the stream index of the copied
+ * AVProgram. The attribute is designated using AVFMT_PROGCOPY_MATCH_ flags.
+ *
+ * If a new program has to be added, the function expects and requires any existing buffer
+ * holding the array of pointers to AVPrograms in the destination context to have its size
+ * be a power-of-two value. This should be the case if all earlier programs were created
+ * using av_new_program or this function.
+ *
+ * @param dst           pointer to the target muxer context
+ * @param src           pointer to the source muxer context
+ * @param progid        ID of the program to be copied
+ * @param flags         combination of flags which determine how streams are matched and
+ *                      whether pre-existing AVProgram in target is overwritten.
+ *                      If no match condition is set, streams will be matched by ids if
+ *                      all source stream ids are non-zero and unique, else by index.
+ *
+ * @return  >= 0 in case of success, Error EEXIST if target already has program with same ID
+ *          and overwrite flag isn't set, else a negative AVERROR code in case of other
+ *          failures.
+ */
+int av_program_copy(AVFormatContext *dst, const AVFormatContext *src, int progid, int flags);
+
 /**
  * @}
  */
@@ -2227,6 +2263,19 @@ AVProgram *av_find_program_from_stream(AVFormatContext *ic, AVProgram *last, int
 void av_program_add_stream_index(AVFormatContext *ac, int progid, unsigned int idx);
 
 /**
+ * Add the supplied index of a stream to the AVProgram with matching id.
+ *
+ * @param ac      the format context which contains the target AVProgram
+ * @param progid  the ID of the AVProgram whose stream index is to be updated
+ * @param idx     the index of the stream to be added
+ *
+ * @return >=0 upon successful addition or if index was already present,
+ *         AVERROR if no matching program is found or stream index is invalid or
+ *         the stream index array reallocation failed.
+ */
+int av_program_add_stream_index2(AVFormatContext *ac, int progid, unsigned int idx);
+
+/**
  * Find the "best" stream in the file.
  * The best stream is determined according to various heuristics as the most
  * likely to be what the user expects.
@@ -2363,6 +2412,101 @@ int av_read_play(AVFormatContext *s);
  * Use av_read_play() to resume it.
  */
 int av_read_pause(AVFormatContext *s);
+
+/**
+ * Command IDs that can be sent to the demuxer
+ *
+ * The following commands can be sent to a demuxer
+ * using ::avformat_send_command.
+ */
+enum AVFormatCommandID {
+    /**
+     * Send a RTSP `SET_PARAMETER` request to the server
+     *
+     * Sends an SET_PARAMETER RTSP command to the server,
+     * with a data payload of type ::AVRTSPCommandRequest,
+     * ownership of it and its data remains with the caller.
+     *
+     * A reply retrieved is of type ::AVRTSPResponse and it
+     * and its contents must be freed by the caller.
+     */
+    AVFORMAT_COMMAND_RTSP_SET_PARAMETER,
+};
+
+typedef struct AVRTSPCommandRequest {
+    /**
+     * Headers sent in the request to the server
+     */
+    AVDictionary *headers;
+
+    /**
+     * Body payload size
+     */
+    size_t body_len;
+
+    /**
+     * Body payload
+     */
+    char *body;
+} AVRTSPCommandRequest;
+
+typedef struct AVRTSPResponse {
+    /**
+     * Response status code from server
+     */
+    int status_code;
+
+    /**
+     * Reason phrase from the server, describing the
+     * status in a human-readable way.
+     */
+    char *reason;
+
+    /**
+     * Body payload size
+     */
+    size_t body_len;
+
+    /**
+     * Body payload
+     */
+    unsigned char *body;
+} AVRTSPResponse;
+
+/**
+ * Send a command to the demuxer
+ *
+ * Sends the specified command and (depending on the command)
+ * optionally a command-specific payload to the demuxer to handle.
+ *
+ * @param s     Format context, must be allocated with
+ *              ::avformat_alloc_context.
+ * @param id    Identifier of type ::AVFormatCommandID,
+ *              indicating the command to send.
+ * @param data  Command-specific data, allocated by the caller
+ *              and ownership remains with the caller.
+ *              For details what is expected here, consult the
+ *              documentation of the respective ::AVFormatCommandID.
+ */
+int avformat_send_command(AVFormatContext *s, enum AVFormatCommandID id, void *data);
+
+/**
+ * Receive a command reply from the demuxer
+ *
+ * Retrieves a reply for a previously sent command from the muxer.
+ *
+ * @param s         Format context, must be allocated with
+ *                  ::avformat_alloc_context.
+ * @param id        Identifier of type ::AVFormatCommandID,
+ *                  indicating the command for which to retrieve
+ *                  the reply.
+ * @param data_out  Pointee is set to the command reply, the actual
+ *                  type depends on the command. This is allocated by
+ *                  the muxer and must be freed with ::av_free.
+ *                  For details on the actual data set here, consult the
+ *                  documentation of the respective ::AVFormatCommandID.
+ */
+int avformat_receive_command_reply(AVFormatContext *s, enum AVFormatCommandID id, void **data_out);
 
 /**
  * Close an opened input AVFormatContext. Free it and all its contents
@@ -2819,7 +2963,8 @@ void av_dump_format(AVFormatContext *ic,
                     int is_output);
 
 
-#define AV_FRAME_FILENAME_FLAGS_MULTIPLE 1 ///< Allow multiple %d
+#define AV_FRAME_FILENAME_FLAGS_MULTIPLE          1  ///< Allow multiple %d
+#define AV_FRAME_FILENAME_FLAGS_IGNORE_TRUNCATION 2  ///< Ignore truncated output instead of returning an error
 
 /**
  * Return in 'buf' the path with '%d' replaced by a number.
@@ -2888,6 +3033,20 @@ int av_match_ext(const char *filename, const char *extensions);
  */
 int avformat_query_codec(const AVOutputFormat *ofmt, enum AVCodecID codec_id,
                          int std_compliance);
+
+struct AVBPrint;
+/**
+ * Make a RFC 4281/6381 like string describing a codec for MIME types.
+ *
+ * @param par pointer to an AVCodecParameters struct describing the codec
+ * @param frame_rate an AVRational for the frame rate, for deciding the
+ *                   right profile for video codecs. Pass an invalid
+ *                   AVRational (1/0) to indicate that it is unknown.
+ * @param out the AVBPrint to write the output to
+ * @return <0 on error
+ */
+int av_mime_codec_str(const AVCodecParameters *par,
+                      AVRational frame_rate, struct AVBPrint *out);
 
 /**
  * @defgroup riff_fourcc RIFF FourCCs

@@ -34,6 +34,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
 #include "libavutil/bprint.h"
@@ -1280,8 +1281,8 @@ static int ebml_parse(MatroskaDemuxContext *matroska,
     MatroskaLevel *level = matroska->num_levels ? &matroska->levels[matroska->num_levels - 1] : NULL;
 
     if (!matroska->current_id) {
-        uint64_t id;
-        res = ebml_read_num(matroska, pb, 4, &id, 0);
+        uint64_t id64;
+        res = ebml_read_num(matroska, pb, 4, &id64, 0);
         if (res < 0) {
             if (pb->eof_reached && res == AVERROR_EOF) {
                 if (matroska->is_live)
@@ -1300,7 +1301,7 @@ static int ebml_parse(MatroskaDemuxContext *matroska,
             }
             return res;
         }
-        matroska->current_id = id | 1 << 7 * res;
+        matroska->current_id = id64 | 1 << 7 * res;
         pos_alt = pos + res;
     } else {
         pos_alt = pos;
@@ -1602,6 +1603,7 @@ static void ebml_free(EbmlSyntax *syntax, void *data)
                 list->alloc_elem_size = 0;
             } else
                 ebml_free(syntax[i].def.n, data_off);
+            break;
         default:
             break;
         }
@@ -1679,7 +1681,7 @@ static int matroska_decode_buffer(uint8_t **buf, int *buf_size,
     uint8_t *data = *buf;
     int isize = *buf_size;
     uint8_t *pkt_data = NULL;
-    uint8_t av_unused *newpktdata;
+    av_unused uint8_t *newpktdata;
     int pkt_size = isize;
     int result = 0;
     int olen;
@@ -2517,7 +2519,7 @@ static int mkv_parse_block_addition_mappings(AVFormatContext *s, AVStream *st, M
                    "Explicit block Addition Mapping type \"Use BlockAddIDValue\", value %"PRIu64","
                    " name \"%s\" found.\n", mapping->value, mapping->name ? mapping->name : "");
             type = MATROSKA_BLOCK_ADD_ID_TYPE_OPAQUE;
-            // fall-through
+            av_fallthrough;
         case MATROSKA_BLOCK_ADD_ID_TYPE_OPAQUE:
         case MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35:
             if (mapping->value != type) {
@@ -2783,6 +2785,10 @@ static int mka_parse_audio_codec(MatroskaTrack *track, AVCodecParameters *par,
             par->block_align  = track->audio.sub_packet_size;
             *extradata_offset = 78;
         }
+        if (par->block_align <= 0 ||
+            track->audio.sub_packet_h * (unsigned)track->audio.frame_size > INT_MAX ||
+            track->audio.frame_size * track->audio.sub_packet_h < par->block_align)
+            return AVERROR_INVALIDDATA;
         track->audio.buf = av_malloc_array(track->audio.sub_packet_h,
                                             track->audio.frame_size);
         if (!track->audio.buf)
@@ -2860,6 +2866,7 @@ static int mka_parse_audio(MatroskaTrack *track, AVStream *st,
                                             (AVRational){1, 1000000000},
                                             (AVRational){1, par->codec_id == AV_CODEC_ID_OPUS ?
                                                             48000 : par->sample_rate});
+        sti->skip_samples = par->initial_padding;
     }
     if (track->seek_preroll > 0) {
         par->seek_preroll = av_rescale_q(track->seek_preroll,
@@ -3045,7 +3052,7 @@ static int mkv_parse_video(MatroskaTrack *track, AVStream *st,
     if (track->video.stereo_mode < MATROSKA_VIDEO_STEREOMODE_TYPE_NB &&
         track->video.stereo_mode != MATROSKA_VIDEO_STEREOMODE_TYPE_ANAGLYPH_CYAN_RED &&
         track->video.stereo_mode != MATROSKA_VIDEO_STEREOMODE_TYPE_ANAGLYPH_GREEN_MAG) {
-        int ret = mkv_stereo3d_conv(st, track->video.stereo_mode);
+        ret = mkv_stereo3d_conv(st, track->video.stereo_mode);
         if (ret < 0)
             return ret;
     }
@@ -3168,11 +3175,20 @@ static int matroska_parse_tracks(AVFormatContext *s)
                     track->default_duration = default_duration;
                 }
             }
-            if (track->video.pixel_cropl >= INT_MAX - track->video.pixel_cropr ||
+            int has_dimensions = track->video.pixel_width || track->video.pixel_height;
+            if ((matroska->ctx->strict_std_compliance >= FF_COMPLIANCE_STRICT &&
+                 (!track->video.pixel_width || !track->video.pixel_height)) ||
+                (track->video.pixel_cropl >= INT_MAX - track->video.pixel_cropr ||
                 track->video.pixel_cropt >= INT_MAX - track->video.pixel_cropb ||
-                (track->video.pixel_cropl + track->video.pixel_cropr) >= track->video.pixel_width ||
-                (track->video.pixel_cropt + track->video.pixel_cropb) >= track->video.pixel_height)
+                (track->video.pixel_cropl + track->video.pixel_cropr) >= track->video.pixel_width  + !has_dimensions ||
+                (track->video.pixel_cropt + track->video.pixel_cropb) >= track->video.pixel_height + !has_dimensions)) {
+                av_log(matroska->ctx, AV_LOG_ERROR,
+                       "Invalid coded dimensions %"PRId64"x%"PRId64" [%"PRId64", %"PRId64", %"PRId64", %"PRId64"].\n",
+                       track->video.pixel_width, track->video.pixel_height,
+                       track->video.pixel_cropl, track->video.pixel_cropr,
+                       track->video.pixel_cropt, track->video.pixel_cropb);
                 return AVERROR_INVALIDDATA;
+            }
             track->video.cropped_width  = track->video.pixel_width  -
                                           track->video.pixel_cropl  - track->video.pixel_cropr;
             track->video.cropped_height = track->video.pixel_height -
@@ -3928,43 +3944,102 @@ static int matroska_parse_block_additional(MatroskaDemuxContext *matroska,
 
         /* ITU-T T.35 metadata */
         country_code  = bytestream2_get_byteu(&bc);
-        provider_code = bytestream2_get_be16u(&bc);
+        switch (country_code) {
+        case ITU_T_T35_COUNTRY_CODE_US:
+            provider_code = bytestream2_get_be16u(&bc);
 
-        if (country_code != ITU_T_T35_COUNTRY_CODE_US ||
-            provider_code != ITU_T_T35_PROVIDER_CODE_SAMSUNG)
-            break; // ignore
+            switch (provider_code) {
+            case ITU_T_T35_PROVIDER_CODE_SAMSUNG: {
+                provider_oriented_code = bytestream2_get_be16u(&bc);
+                application_identifier = bytestream2_get_byteu(&bc);
 
-        provider_oriented_code = bytestream2_get_be16u(&bc);
-        application_identifier = bytestream2_get_byteu(&bc);
+                if (provider_oriented_code != 1 || application_identifier != 4)
+                    break; // ignore
 
-        if (provider_oriented_code != 1 || application_identifier != 4)
-            break; // ignore
+                hdrplus = av_dynamic_hdr_plus_alloc(&hdrplus_size);
+                if (!hdrplus)
+                    return AVERROR(ENOMEM);
 
-        hdrplus = av_dynamic_hdr_plus_alloc(&hdrplus_size);
-        if (!hdrplus)
-            return AVERROR(ENOMEM);
+                if ((res = av_dynamic_hdr_plus_from_t35(hdrplus, bc.buffer,
+                                                        bytestream2_get_bytes_left(&bc))) < 0 ||
+                    (res = av_packet_add_side_data(pkt, AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+                                                   (uint8_t *)hdrplus, hdrplus_size)) < 0) {
+                    av_free(hdrplus);
+                    return res;
+                }
 
-        if ((res = av_dynamic_hdr_plus_from_t35(hdrplus, bc.buffer,
-                                                bytestream2_get_bytes_left(&bc))) < 0 ||
-            (res = av_packet_add_side_data(pkt, AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
-                                           (uint8_t *)hdrplus, hdrplus_size)) < 0) {
-            av_free(hdrplus);
-            return res;
+                break;
+            }
+            case ITU_T_T35_PROVIDER_CODE_SMPTE: {
+                AVDynamicHDRSmpte2094App5 *hdr_smpte_2094_app5;
+                size_t hdr_smpte_2094_app5_size;
+
+                provider_oriented_code = bytestream2_get_be16u(&bc);
+                if (provider_oriented_code != 1)
+                    break; // ignore
+
+                hdr_smpte_2094_app5 = av_dynamic_hdr_smpte2094_app5_alloc(&hdr_smpte_2094_app5_size);
+                if (!hdr_smpte_2094_app5)
+                    return AVERROR(ENOMEM);
+
+                if ((res = av_dynamic_hdr_smpte2094_app5_from_t35(hdr_smpte_2094_app5,
+                                                                  bc.buffer,
+                                                                  bytestream2_get_bytes_left(&bc))) < 0 ||
+                    (res = av_packet_add_side_data(pkt,
+                                                   AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+                                                   (uint8_t *)hdr_smpte_2094_app5,
+                                                   hdr_smpte_2094_app5_size)) < 0) {
+                    av_free(hdr_smpte_2094_app5);
+                    return res;
+                }
+
+                break;
+            }
+            default:
+                break;
+            }
+            break;
+        case ITU_T_T35_COUNTRY_CODE_UK:
+            bytestream2_skipu(&bc, 1); // t35_uk_country_code_second_octet
+            if (bytestream2_get_bytes_left(&bc) < 2)
+                return AVERROR_INVALIDDATA;
+
+            provider_code = bytestream2_get_be16u(&bc);
+
+            switch (provider_code) {
+            case ITU_T_T35_PROVIDER_CODE_VNOVA: {
+                uint8_t *data;
+                int left = bytestream2_get_bytes_left(&bc);
+
+                if (left < 2)
+                    return AVERROR_INVALIDDATA;
+                data = av_packet_new_side_data(pkt, AV_PKT_DATA_LCEVC, left);
+                if (!data)
+                    return AVERROR(ENOMEM);
+
+                bytestream2_get_bufferu(&bc, data, left);
+
+                return 0;
+            }
+            default:
+                break;
+            }
+            break;
+        default:
+            break;
         }
-
-        return 0;
-    }
-    default:
         break;
     }
-
-    side_data = av_packet_new_side_data(pkt, AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+    default:
+        side_data = av_packet_new_side_data(pkt, AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
                                         size + (size_t)8);
-    if (!side_data)
-        return AVERROR(ENOMEM);
+        if (!side_data)
+            return AVERROR(ENOMEM);
 
-    AV_WB64(side_data, id);
-    memcpy(side_data + 8, data, size);
+        AV_WB64(side_data, id);
+        memcpy(side_data + 8, data, size);
+        break;
+    }
 
     return 0;
 }
@@ -4444,6 +4519,10 @@ static CueDesc get_cue_desc(AVFormatContext *s, int64_t ts, int64_t cues_start) 
         // Clusters.
         cue_desc.end_offset = cues_start - matroska->segment_start;
     }
+
+    if (cue_desc.end_time_ns < cue_desc.start_time_ns)
+        return (CueDesc) {-1, -1, -1, -1};
+
     return cue_desc;
 }
 
@@ -4744,8 +4823,8 @@ static int webm_dash_manifest_cues(AVFormatContext *s, int64_t init_range)
     // Store cue point timestamps as a comma separated list
     // for checking subsegment alignment in the muxer.
     av_bprint_init(&bprint, 0, AV_BPRINT_SIZE_UNLIMITED);
-    for (int i = 0; i < sti->nb_index_entries; i++)
-        av_bprintf(&bprint, "%" PRId64",", sti->index_entries[i].timestamp);
+    for (int j = 0; j < sti->nb_index_entries; j++)
+        av_bprintf(&bprint, "%" PRId64",", sti->index_entries[j].timestamp);
     if (!av_bprint_is_complete(&bprint)) {
         av_bprint_finalize(&bprint, NULL);
         return AVERROR(ENOMEM);

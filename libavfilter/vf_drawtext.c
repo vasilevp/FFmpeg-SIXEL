@@ -1011,7 +1011,7 @@ static av_cold int init(AVFilterContext *ctx)
             av_log(ctx, AV_LOG_WARNING, "Multiple texts provided, will use text_source only\n");
             av_free(s->text);
         }
-        s->text = av_mallocz(AV_DETECTION_BBOX_LABEL_NAME_MAX_SIZE *
+        s->text = av_mallocz((AV_DETECTION_BBOX_LABEL_NAME_MAX_SIZE + 1) *
                              (AV_NUM_DETECTION_BBOX_CLASSIFY + 1));
         if (!s->text)
             return AVERROR(ENOMEM);
@@ -1144,7 +1144,7 @@ static int config_input(AVFilterLink *inlink)
     char *expr;
     int ret;
 
-    ret = ff_draw_init2(&s->dc, inlink->format, inlink->colorspace, inlink->color_range, FF_DRAW_PROCESS_ALPHA);
+    ret = ff_draw_init_from_link(&s->dc, inlink, FF_DRAW_PROCESS_ALPHA);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
         return ret;
@@ -1269,11 +1269,12 @@ static void update_alpha(DrawTextContext *s)
         s->alpha = 256 * alpha;
 }
 
-static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
+static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        FFDrawColor *color,
                        TextMetrics *metrics,
                        int x, int y, int borderw)
 {
+    DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
     int dx = 0, dy = 0, pdx = 0;
     GlyphInfo *info;
@@ -1297,7 +1298,7 @@ static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
 
     if ((!j_left || j_right) && !s->tab_warning_printed && s->tab_count > 0) {
         s->tab_warning_printed = 1;
-        av_log(s, AV_LOG_WARNING, "Tab characters are only supported with left horizontal alignment\n");
+        av_log(ctx, AV_LOG_WARNING, "Tab characters are only supported with left horizontal alignment\n");
     }
 
     clip_x = FFMIN(metrics->rect_x + s->box_width + s->bb_right, frame->width);
@@ -1394,8 +1395,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics)
 {
     DrawTextContext *s = ctx->priv;
     char *text = s->expanded_text.str;
-    char *textdup = NULL, *start = NULL;
-    int num_chars = 0;
+    char *textdup = NULL;
     int width64 = 0, w64 = 0;
     int cur_min_y64 = 0, first_max_y64 = -32000;
     int first_min_x64 = 32000, last_max_x64 = -32000;
@@ -1405,7 +1405,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics)
     Glyph *glyph = NULL;
 
     int i, tab_idx = 0, last_tab_idx = 0, line_offset = 0;
-    char* p;
+    uint8_t *start, *p;
     int ret = 0;
 
     // Count the lines and the tab characters
@@ -1435,8 +1435,13 @@ continue_on_failed:
     }
 
     s->line_count = line_count;
-    s->lines = av_mallocz(line_count * sizeof(TextLine));
-    s->tab_clusters = av_mallocz(s->tab_count * sizeof(uint32_t));
+    s->lines = av_calloc(line_count, sizeof(TextLine));
+    s->tab_clusters = av_calloc(s->tab_count, sizeof(uint32_t));
+    if ((line_count > 0 && !s->lines) ||
+        (s->tab_count > 0 && !s->tab_clusters)) {
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
     for (i = 0; i < s->tab_count; ++i) {
         s->tab_clusters[i] = -1;
     }
@@ -1452,13 +1457,14 @@ continue_on_failed:
             s->tab_clusters[tab_idx++] = i;
             *p = ' ';
         }
+        size_t len = p - start;
         GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_on_failed2;);
 continue_on_failed2:
         if (ff_is_newline(code) || code == 0) {
             TextLine *cur_line = &s->lines[line_count];
             HarfbuzzData *hb = &cur_line->hb_data;
             cur_line->cluster_offset = line_offset;
-            ret = shape_text_hb(s, hb, start, num_chars);
+            ret = shape_text_hb(s, hb, start, len);
             if (ret != 0) {
                 goto done;
             }
@@ -1510,20 +1516,18 @@ continue_on_failed2:
 
             cur_line->width64 = w64;
 
-            av_log(s, AV_LOG_DEBUG, "  Line: %d -- glyphs count: %d - width64: %d - offset_left64: %d - offset_right64: %d)\n",
+            av_log(ctx, AV_LOG_DEBUG, "  Line: %d -- glyphs count: %d - width64: %d - offset_left64: %d - offset_right64: %d)\n",
                 line_count, hb->glyph_count, cur_line->width64, cur_line->offset_left64, cur_line->offset_right64);
 
             if (w64 > width64) {
                 width64 = w64;
             }
-            num_chars = -1;
             start = p;
             ++line_count;
             line_offset = i + 1;
         }
 
         if (code == 0) break;
-        ++num_chars;
     }
 
     metrics->line_height64 = s->face->size->metrics.height;
@@ -1613,7 +1617,7 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             return ret;
         if (!av_bprint_is_complete(&s->expanded_fontcolor))
             return AVERROR(ENOMEM);
-        av_log(s, AV_LOG_DEBUG, "Evaluated fontcolor is '%s'\n", s->expanded_fontcolor.str);
+        av_log(ctx, AV_LOG_DEBUG, "Evaluated fontcolor is '%s'\n", s->expanded_fontcolor.str);
         ret = av_parse_color(s->fontcolor.rgba, s->expanded_fontcolor.str, -1, s);
         if (ret)
             return ret;
@@ -1797,20 +1801,20 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         }
 
         if (s->shadowx || s->shadowy) {
-            if ((ret = draw_glyphs(s, frame, &shadowcolor, &metrics,
+            if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
                     s->shadowx, s->shadowy, s->borderw)) < 0) {
                 return ret;
             }
         }
 
         if (s->borderw) {
-            if ((ret = draw_glyphs(s, frame, &bordercolor, &metrics,
+            if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
                     0, 0, s->borderw)) < 0) {
                 return ret;
             }
         }
 
-        if ((ret = draw_glyphs(s, frame, &fontcolor, &metrics, 0,
+        if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0,
                 0, 0)) < 0) {
             return ret;
         }
@@ -1846,7 +1850,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             header = (AVDetectionBBoxHeader *)sd->data;
             loop = header->nb_bboxes;
         } else {
-            av_log(s, AV_LOG_WARNING, "No detection bboxes.\n");
+            av_log(ctx, AV_LOG_WARNING, "No detection bboxes.\n");
             return ff_filter_frame(outlink, frame);
         }
     }
@@ -1885,7 +1889,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             s->x = bbox->x;
             s->y = bbox->y - s->fontsize;
         }
-        draw_text(ctx, frame);
+        ret = draw_text(ctx, frame);
+        if (ret < 0) {
+            av_frame_free(&frame);
+            return ret;
+        }
     }
 
     return ff_filter_frame(outlink, frame);

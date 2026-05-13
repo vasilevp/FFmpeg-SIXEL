@@ -23,6 +23,7 @@
 #include <math.h>
 #include <stdio.h>
 #include "config.h"
+#include "libavutil/attributes.h"
 #include "swscale.h"
 #include "swscale_internal.h"
 #include "rgb2rgb.h"
@@ -126,9 +127,13 @@ void ff_copyPlane(const uint8_t *src, int srcStride,
                   int srcSliceY, int srcSliceH, int width,
                   uint8_t *dst, int dstStride)
 {
+    if (!srcSliceH)
+        return;
+    av_assert0(srcSliceH > 0);
+
     dst += dstStride * srcSliceY;
     if (dstStride == srcStride && srcStride > 0) {
-        memcpy(dst, src, srcSliceH * dstStride);
+        memcpy(dst, src, (srcSliceH - 1) * dstStride + width);
     } else {
         int i;
         for (i = 0; i < srcSliceH; i++) {
@@ -1287,6 +1292,7 @@ static int planarRgbaToRgbWrapper(SwsInternal *c, const uint8_t *const src[],
 
     case AV_PIX_FMT_ARGB:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_RGBA:
         gbraptopacked32(src201, stride201,
                         dst[0] + srcSliceY * dstStride[0], dstStride[0],
@@ -1295,6 +1301,7 @@ static int planarRgbaToRgbWrapper(SwsInternal *c, const uint8_t *const src[],
 
     case AV_PIX_FMT_ABGR:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_BGRA:
         gbraptopacked32(src102, stride102,
                         dst[0] + srcSliceY * dstStride[0], dstStride[0],
@@ -1343,6 +1350,7 @@ static int planarRgbToRgbWrapper(SwsInternal *c, const uint8_t *const src[],
 
     case AV_PIX_FMT_ARGB:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_RGBA:
         gbr24ptopacked32(src201, stride201,
                          dst[0] + srcSliceY * dstStride[0], dstStride[0],
@@ -1351,6 +1359,7 @@ static int planarRgbToRgbWrapper(SwsInternal *c, const uint8_t *const src[],
 
     case AV_PIX_FMT_ABGR:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_BGRA:
         gbr24ptopacked32(src102, stride102,
                          dst[0] + srcSliceY * dstStride[0], dstStride[0],
@@ -1445,12 +1454,14 @@ static int rgbToPlanarRgbWrapper(SwsInternal *c, const uint8_t *const src[],
         break;
     case AV_PIX_FMT_ARGB:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_RGBA:
         packedtogbr24p((const uint8_t *) src[0], srcStride[0], dst201,
                        stride201, srcSliceH, alpha_first, 4, c->opts.src_w);
         break;
     case AV_PIX_FMT_ABGR:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_BGRA:
         packedtogbr24p((const uint8_t *) src[0], srcStride[0], dst102,
                        stride102, srcSliceH, alpha_first, 4, c->opts.src_w);
@@ -1555,12 +1566,14 @@ static int rgbToPlanarRgbaWrapper(SwsInternal *c, const uint8_t *const src[],
         break;
     case AV_PIX_FMT_ARGB:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_RGBA:
         packed32togbrap((const uint8_t *) src[0], srcStride[0], dst201,
                         stride201, srcSliceH, alpha_first, c->opts.src_w);
         break;
     case AV_PIX_FMT_ABGR:
         alpha_first = 1;
+        av_fallthrough;
     case AV_PIX_FMT_BGRA:
         packed32togbrap((const uint8_t *) src[0], srcStride[0], dst102,
                         stride102, srcSliceH, alpha_first, c->opts.src_w);
@@ -1994,8 +2007,8 @@ static int rgbToRgbWrapper(SwsInternal *c, const uint8_t *const src[], const int
     const enum AVPixelFormat dstFormat = c->opts.dst_format;
     const AVPixFmtDescriptor *desc_src = av_pix_fmt_desc_get(c->opts.src_format);
     const AVPixFmtDescriptor *desc_dst = av_pix_fmt_desc_get(c->opts.dst_format);
-    const int srcBpp = (c->srcFormatBpp + 7) >> 3;
-    const int dstBpp = (c->dstFormatBpp + 7) >> 3;
+    const int srcBpp = desc_src->comp[0].step;
+    const int dstBpp = desc_dst->comp[0].step;
     rgbConvFn conv = findRgbConvFn(c);
 
     if (!conv) {
@@ -2004,8 +2017,8 @@ static int rgbToRgbWrapper(SwsInternal *c, const uint8_t *const src[], const int
     } else {
         const uint8_t *srcPtr = src[0];
               uint8_t *dstPtr = dst[0];
-        int src_bswap = IS_NOT_NE(c->srcFormatBpp, desc_src);
-        int dst_bswap = IS_NOT_NE(c->dstFormatBpp, desc_dst);
+        int src_bswap = IS_NOT_NE(srcBpp, desc_src);
+        int dst_bswap = IS_NOT_NE(dstBpp, desc_dst);
 
         if ((srcFormat == AV_PIX_FMT_RGB32_1 || srcFormat == AV_PIX_FMT_BGR32_1) &&
             !isRGBA32(dstFormat))
@@ -2132,14 +2145,8 @@ static int packedCopyWrapper(SwsInternal *c, const uint8_t *const src[],
         int i;
         const uint8_t *srcPtr = src[0];
         uint8_t *dstPtr = dst[0] + dstStride[0] * srcSliceY;
-        int length = 0;
 
-        /* universal length finder */
-        while (length + c->opts.src_w <= FFABS(dstStride[0]) &&
-               length + c->opts.src_w <= FFABS(srcStride[0]))
-            length += c->opts.src_w;
-        av_assert1(length != 0);
-
+        const int length = FFMIN(FFABS(dstStride[0]), FFABS(srcStride[0]));
         for (i = 0; i < srcSliceH; i++) {
             memcpy(dstPtr, srcPtr, length);
             srcPtr += srcStride[0];
@@ -2361,6 +2368,8 @@ static int planarCopyWrapper(SwsInternal *c, const uint8_t *const src[],
             } else {
                 if (is16BPS(c->opts.src_format) && is16BPS(c->opts.dst_format))
                     length *= 2;
+                else if (isFloat(c->opts.src_format) && isFloat(c->opts.dst_format))
+                    length *= 4;
                 else if (desc_src->comp[0].depth == 1)
                     length >>= 3; // monowhite/black
                 for (i = 0; i < height; i++) {
@@ -2676,11 +2685,16 @@ void ff_get_unscaled_swscale(SwsInternal *c)
          isSemiPlanarYUV(srcFormat) == isSemiPlanarYUV(dstFormat) &&
          isSwappedChroma(srcFormat) == isSwappedChroma(dstFormat))))
     {
-        if (isPacked(c->opts.src_format))
+        if (isPacked(c->opts.src_format)) {
             c->convert_unscaled = packedCopyWrapper;
-        else /* Planar YUV or gray */
+        } else { /* Planar YUV or gray */
             c->convert_unscaled = planarCopyWrapper;
+            if (c->opts.dither != SWS_DITHER_NONE)
+                c->dst_slice_align = 8 << c->chrDstVSubSample;
+        }
     }
+
+    ff_sws_init_xyzdsp(c);
 
 #if ARCH_PPC
     ff_get_unscaled_swscale_ppc(c);

@@ -136,7 +136,7 @@ static av_cold int dovi_configure_ext(DOVIContext *s, enum AVCodecID codec_id,
             bl_compat_id = 0;
             break;
         }
-        /* fall through */
+        av_fallthrough;
     case 8: /* HEVC (or AV1) with BL compatibility */
         if (color_space == AVCOL_SPC_BT2020_NCL &&
             color_primaries == AVCOL_PRI_BT2020 &&
@@ -546,12 +546,8 @@ static void generate_ext_v2(PutBitContext *pb, const AVDOVIDmData *dm)
         put_bits(pb, 4, dm->l11.whitepoint);
         put_bits(pb, 1, dm->l11.reference_mode_flag);
         put_bits(pb, 3, 0); /* reserved */
-        put_bits(pb, 2, dm->l11.sharpness);
-        put_bits(pb, 2, dm->l11.noise_reduction);
-        put_bits(pb, 2, dm->l11.mpeg_noise_reduction);
-        put_bits(pb, 2, dm->l11.frame_rate_conversion);
-        put_bits(pb, 2, dm->l11.brightness);
-        put_bits(pb, 2, dm->l11.color);
+        put_bits(pb, 8, 0); /* reserved */
+        put_bits(pb, 8, 0); /* reserved */
         break;
     case 254:
         put_bits(pb, 8, dm->l254.dm_mode);
@@ -616,7 +612,7 @@ int ff_dovi_rpu_generate(DOVIContext *s, const AVDOVIMetadata *metadata,
         /* Limited metadata compression requires vdr_rpi_id == 0 */
         if (vdr_rpu_id != 0)
             break;
-        /* fall through */
+        av_fallthrough;
     case AV_DOVI_COMPRESSION_EXTENDED:
         if (s->vdr[vdr_rpu_id])
             use_prev_vdr_rpu = !memcmp(s->vdr[vdr_rpu_id], mapping, sizeof(*mapping));

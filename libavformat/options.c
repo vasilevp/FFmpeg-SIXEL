@@ -26,6 +26,7 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec_par.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/iamf.h"
 #include "libavutil/internal.h"
@@ -45,7 +46,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
 static const char* format_to_name(void* ptr)
 {
     AVFormatContext* fc = (AVFormatContext*) ptr;
-    if(fc->iformat) return fc->iformat->name;
+    if (fc->name) return fc->name;
+    else if(fc->iformat) return fc->iformat->name;
     else if(fc->oformat) return fc->oformat->name;
     else return fc->av_class->class_name;
 }
@@ -270,6 +272,10 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
 
     sti->fmtctx = s;
 
+    sti->parse_pkt = av_packet_alloc();
+    if (!sti->parse_pkt)
+        goto fail;
+
     if (s->iformat) {
         sti->avctx = avcodec_alloc_context3(NULL);
         if (!sti->avctx)
@@ -346,6 +352,8 @@ static const AVClass tile_grid_class = {
 
 #define OFFSET(x) offsetof(AVStreamGroupLCEVC, x)
 static const AVOption lcevc_options[] = {
+    { "lcevc_index", "Index of the LCEVC stream within the group", OFFSET(lcevc_index),
+        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
     { "video_size", "size of video after LCEVC enhancement has been applied", OFFSET(width),
         AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, FLAGS },
     { NULL },
@@ -388,7 +396,7 @@ static const AVClass *stream_group_child_iterate(void **opaque)
     switch(i) {
     case AV_STREAM_GROUP_PARAMS_NONE:
         i++;
-    // fall-through
+        av_fallthrough;
     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
         ret = av_iamf_audio_element_get_class();
         break;

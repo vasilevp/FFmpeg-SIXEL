@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "libavutil/attributes.h"
+#include "avcodec.h"
 #include "codec.h"
 #include "config.h"
 
@@ -101,7 +102,6 @@ typedef struct FFCodecDefault {
 struct AVCodecContext;
 struct AVSubtitle;
 struct AVPacket;
-enum AVCodecConfig;
 
 enum FFCodecType {
     /* The codec is a decoder using the decode callback;
@@ -133,7 +133,7 @@ typedef struct FFCodec {
     /**
      * Internal codec capabilities FF_CODEC_CAP_*.
      */
-    unsigned caps_internal:26;
+    unsigned caps_internal:24;
 
     /**
      * Is this a decoder?
@@ -145,6 +145,12 @@ typedef struct FFCodec {
      * Should be set to a bitmask of AVCOL_RANGE_MPEG and AVCOL_RANGE_JPEG.
      */
     unsigned color_ranges:2;
+
+    /**
+     * This field determines the alpha modes supported by an encoder.
+     * Should be set to a bitmask of AVALPHA_MODE_PREMULTIPLIED and AVALPHA_MODE_STRAIGHT.
+     */
+    unsigned alpha_modes:2;
 
     /**
      * This field determines the type of the codec (decoder/encoder)

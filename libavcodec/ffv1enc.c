@@ -435,7 +435,7 @@ static void set_micro_version(FFV1Context *f)
         if (f->version == 3) {
             f->micro_version = 4;
         } else if (f->version == 4) {
-            f->micro_version = 8;
+            f->micro_version = 9;
         } else
             av_assert0(0);
 
@@ -815,6 +815,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
     case AV_PIX_FMT_YUVA420P9:
         if (!avctx->bits_per_raw_sample)
             s->bits_per_raw_sample = 9;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY10:
     case AV_PIX_FMT_YUV444P10:
     case AV_PIX_FMT_YUV440P10:
@@ -825,6 +826,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
     case AV_PIX_FMT_YUVA420P10:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 10;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY12:
     case AV_PIX_FMT_YUV444P12:
     case AV_PIX_FMT_YUV440P12:
@@ -834,6 +836,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
     case AV_PIX_FMT_YUVA422P12:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 12;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY14:
     case AV_PIX_FMT_YUV444P14:
     case AV_PIX_FMT_YUV420P14:
@@ -841,6 +844,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 14;
         s->packed_at_lsb = 1;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY16:
     case AV_PIX_FMT_P016:
     case AV_PIX_FMT_P216:
@@ -863,6 +867,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
             return AVERROR_INVALIDDATA;
         }
         s->version = FFMAX(s->version, 1);
+        av_fallthrough;
     case AV_PIX_FMT_GRAY8:
     case AV_PIX_FMT_YA8:
     case AV_PIX_FMT_NV12:
@@ -906,6 +911,7 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
         s->use32bit = 1;
         s->version = FFMAX(s->version, 1);
         break;
+    case AV_PIX_FMT_GBRP:
     case AV_PIX_FMT_0RGB32:
         s->colorspace = 1;
         s->chroma_planes = 1;
@@ -914,24 +920,31 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
     case AV_PIX_FMT_GBRP9:
         if (!avctx->bits_per_raw_sample)
             s->bits_per_raw_sample = 9;
+        av_fallthrough;
+    case AV_PIX_FMT_X2BGR10:
+    case AV_PIX_FMT_X2RGB10:
     case AV_PIX_FMT_GBRP10:
     case AV_PIX_FMT_GBRAP10:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 10;
+        av_fallthrough;
     case AV_PIX_FMT_GBRP12:
     case AV_PIX_FMT_GBRAP12:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 12;
+        av_fallthrough;
     case AV_PIX_FMT_GBRP14:
     case AV_PIX_FMT_GBRAP14:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 14;
+        av_fallthrough;
     case AV_PIX_FMT_GBRP16:
     case AV_PIX_FMT_GBRAP16:
     case AV_PIX_FMT_GBRPF16:
     case AV_PIX_FMT_GBRAPF16:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
             s->bits_per_raw_sample = 16;
+        av_fallthrough;
     case AV_PIX_FMT_GBRPF32:
     case AV_PIX_FMT_GBRAPF32:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
@@ -1310,7 +1323,7 @@ static int encode_float32_remap_segment(FFV1SliceContext *sc,
         int current_mul = current_mul_index < 0 ? 1 : FFABS(mul[current_mul_index]);
         int64_t val;
         if (i == pixel_num) {
-            if (last_val == 0xFFFFFFFF) {
+            if (last_val == 0xFFFFFFFF && (!run || run1final)) {
                 break;
             } else {
                 val = last_val + ((1LL<<32) - last_val + current_mul - 1) / current_mul * current_mul;
@@ -1684,9 +1697,11 @@ size_t ff_ffv1_encode_buffer_size(AVCodecContext *avctx)
 {
     FFV1Context *f = avctx->priv_data;
 
-    size_t maxsize = avctx->width*avctx->height * (1 + f->transparency);
+    int w = avctx->width  + f->num_h_slices;
+    int h = avctx->height + f->num_v_slices;
+    size_t maxsize = w*h * (1 + f->transparency);
     if (f->chroma_planes)
-        maxsize += AV_CEIL_RSHIFT(avctx->width, f->chroma_h_shift) * AV_CEIL_RSHIFT(f->height, f->chroma_v_shift) * 2;
+        maxsize += AV_CEIL_RSHIFT(w, f->chroma_h_shift) * AV_CEIL_RSHIFT(h, f->chroma_v_shift) * 2;
     maxsize += f->slice_count * 800; //for slice header
     if (f->version > 3) {
         maxsize *= f->bits_per_raw_sample + 1;
